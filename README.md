@@ -62,8 +62,48 @@ a `.key` file for future use.)
 
 ### Options
 
+The `--fresh-launch` option handles overlays that accept a relaunch but do
+not reload their initial script. It obtains the selected overlay's session ID,
+waits one second for initial creation, closes that exact session, waits another
+second, then launches the payload. An
+unconfirmed close stops the attempt. Verify the TV's autoroot result separately;
+page loading alone does not prove successful rooting.
+
+The local HTTP server also handles concurrent connections so an idle browser
+preconnection cannot block the payload download.
+
+`--bind-ip 127.0.0.1` binds the payload server only to the PC's loopback interface.
+Combine it with an already established SSH reverse tunnel and `--local-ip` set to
+the tunnel's TV-side address. The advertised address and local binding are
+different settings. This option does not create a tunnel or change any firewall.
+
 The `--debug` option enables extra output on the TV screen as well as in
-`autoroot.log`.
+`autoroot.log`. The page also sends its status and debug messages back to the
+serving PC in this mode, including a delayed status query for a stalled download.
+
+`--staged-dir /tmp/slopbro-stage-<digits>` bypasses the TV download manager.
+This is an optional workaround when the overlay loads but its download ticket
+remains at zero bytes. It requires a working developer SSH connection. Before
+running SlopBro, create a fresh directory with that name in the TV's shared
+`/tmp`, then upload the reviewed `wwwroot/autoroot.sh`, `wwwroot/main.js`, and
+`wwwroot/package.json` into it. Use LF line endings and readable file permissions;
+verify the uploaded files match your local copies. Do not use files from an
+untrusted or reused directory. The launcher does not upload or validate those
+files for you. The page uses the staged directory as the service working directory
+and launches the same payload without issuing download-manager requests.
+
+For example, after staging those three files at `/tmp/slopbro-stage-123456`:
+
+```bash
+python3 slopbro.py --fresh-launch --staged-dir /tmp/slopbro-stage-123456 --debug --webos-version 6.5 <TV-IP>
+```
+
+The page still needs HTTP access to the PC. If using a developer SSH reverse
+tunnel instead of a direct LAN connection, create it separately and pass the
+appropriate `--bind-ip` and `--local-ip`. In staged mode the server stays running
+for diagnostics until Ctrl+C; it does not wait for payload downloads that were
+deliberately skipped. Verify the autoroot logs separately: a successful service
+launch is not proof of successful installation or persistence after reboot.
 
 The `--curl-insecure` option passes `-k` to `curl` when downloading Homebrew
 Channel, disabling TLS certificate verification. Use it only when necessary
@@ -136,6 +176,12 @@ Run the CLI and HTTP handler regression tests without connecting to a TV:
 
 ```bash
 python3 -m unittest discover -s tests -v
+```
+
+The optional offline JavaScript payload fixture requires Node.js:
+
+```bash
+node tests/test_payload_lifetime.cjs
 ```
 
 ## Troubleshooting

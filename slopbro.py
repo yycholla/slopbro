@@ -25,6 +25,7 @@ import io
 import json
 import os
 import posixpath
+import re
 import socket
 import ssl
 import struct
@@ -32,8 +33,15 @@ import sys
 import threading
 import time
 from hashlib import sha1
-from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHandler
-from urllib.parse import unquote, urlsplit
+from http.server import BaseHTTPRequestHandler, HTTPServer as BaseHTTPServer, SimpleHTTPRequestHandler
+from socketserver import ThreadingMixIn
+from urllib.parse import parse_qs, unquote, urlsplit
+
+
+class HTTPServer(ThreadingMixIn, BaseHTTPServer):
+    """An idle WAM/Chromium preconnection must not monopolize the file server."""
+    daemon_threads = True
+
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -490,6 +498,28 @@ def launch_app(client, app_id, params):
     return resp.get("payload") or {}
 
 
+def launch_app_fresh(client, app_id, params):
+    """Cold-launch an overlay whose initial script ignores later launch parameters.
+
+    Obtain its real launch session, close that exact session, then navigate on a
+    fresh load. Never claim freshness if the session or close is unconfirmed.
+    """
+    session = launch_app(client, app_id, {})
+    session_id = session.get("sessionId")
+    if not session_id:
+        raise SSAPError("fresh launch requires the TV's returned sessionId")
+    # SSAP acknowledges launch before WAM has necessarily created the session.
+    time.sleep(1)
+    response = client.request(
+        "ssap://system.launcher/close", {"id": app_id, "sessionId": session_id}
+    )
+    if response.get("type") == "error" or not (response.get("payload") or {}).get("returnValue"):
+        raise SSAPError("fresh launch refused: overlay session close was not confirmed (%s)" % response)
+    # Give WAM the same bounded teardown interval verified by the device probe.
+    time.sleep(1)
+    return launch_app(client, app_id, params)
+
+
 def get_webos_version(client):
     """Query the TV's webOS version over SSAP and return it as a string.
 
@@ -718,6 +748,17 @@ def make_tracking_handler(
     tracked = set(tracked_files)
 
     class TrackingHTTPRequestHandler(SimpleHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urlsplit(self.path)
+            if parsed.path == "/__slopbro_log":
+                message = parse_qs(parsed.query).get("message", [""])[0][:4096]
+                log("TV: %s" % repr(message))
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            super().do_GET()
+
         def _requested_rel_path(self):
             raw_path = urlsplit(self.path).path
             raw_path = unquote(raw_path, errors="surrogatepass")
@@ -813,6 +854,7 @@ def build_self_hosted_url(
     local_ip_override=None,
     curl_insecure=False,
     fake_service_path=DEFAULT_FAKE_SERVICE_PATH,
+    staged_dir=None,
 ):
     local_ip = local_ip_override or local_ip_for_remote(tv_host)
     url = "http://%s:%d/%s" % (local_ip, server_port, ENTRY_PAGE)
@@ -823,6 +865,8 @@ def build_self_hosted_url(
         url += "&curl-insecure"
     if fake_service_path:
         url += "&fake-service-path=%s" % fake_service_path
+    if staged_dir is not None:
+        url += "&staged-dir=%s" % _staged_dir_arg(staged_dir)
     return url
 
 
@@ -1012,6 +1056,9 @@ def run(
     webos_version_override=None,
     curl_insecure=False,
     fake_service_path=DEFAULT_FAKE_SERVICE_PATH,
+    fresh_launch=False,
+    bind_ip=None,
+    staged_dir=None,
 ):
     secure = True
     port = PORT_TLS if secure else PORT_PLAIN
@@ -1050,12 +1097,14 @@ def run(
     else:
         log("warning: no files found in %s" % wwwroot_dir)
     try:
+        server_options = {"bind_host": bind_ip} if bind_ip is not None else {}
         http_server = start_http_server(
             wwwroot_dir,
             tracker,
             tracked_files,
             allow_embedded_assets,
             allow_filesystem_fallback,
+            **server_options,
         )
         page_url = build_self_hosted_url(
             host,
@@ -1064,6 +1113,7 @@ def run(
             curl_insecure=curl_insecure,
             local_ip_override=local_ip_override,
             fake_service_path=fake_service_path,
+            **({"staged_dir": staged_dir} if staged_dir is not None else {}),
         )
     except Exception as exc:
         die("could not start self-hosted page server: %s" % exc)
@@ -1118,15 +1168,24 @@ def run(
 
         log("launching %s -> %s" % (app_id, page_url))
         try:
-            result = launch_app(client, app_id, {url_param_name: page_url})
+            launcher = launch_app_fresh if fresh_launch else launch_app
+            result = launcher(client, app_id, {url_param_name: page_url})
         except SSAPError as exc:
             die("%s" % exc)
 
         print(json.dumps(result, sort_keys=True))
 
-        log("waiting for all tracked files to be requested")
-        tracker.wait_for_all(None)
-        log("done; all tracked files were requested (❛ ᴗ ❛)")
+        if staged_dir is not None:
+            log("using pre-staged payloads; HTTP downloads are not expected")
+            log("verify the autoroot result on the TV, then press Ctrl+C to stop serving")
+            try:
+                threading.Event().wait()
+            except KeyboardInterrupt:
+                log("stopping server; this does not confirm the autoroot result")
+        else:
+            log("waiting for all tracked files to be requested")
+            tracker.wait_for_all(None)
+            log("done; all tracked files were requested (❛ ᴗ ❛)")
     finally:
         client.close()
         if http_server is not None:
@@ -1146,6 +1205,12 @@ def _fake_service_path_arg(value):
     return value
 
 
+def _staged_dir_arg(value):
+    if re.fullmatch(r"/tmp/slopbro-stage-[0-9]+", value) is None:
+        raise argparse.ArgumentTypeError("expected /tmp/slopbro-stage-<digits>")
+    return value
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Pair with an LG webOS TV and launch a self-hosted payload page.",
@@ -1157,6 +1222,18 @@ def main(argv=None):
     )
     parser.add_argument(
         "--debug", action="store_true", help="enable payload debug output",
+    )
+    parser.add_argument(
+        "--fresh-launch", action="store_true",
+        help="close the returned overlay session before loading the payload (webOS 6 relaunch workaround)",
+    )
+    parser.add_argument(
+        "--bind-ip", metavar="<ipv4>",
+        help="bind the payload HTTP server to this local address (e.g. 127.0.0.1 for an SSH tunnel)",
+    )
+    parser.add_argument(
+        "--staged-dir", type=_staged_dir_arg, metavar="<tv-directory>",
+        help="use payload files already staged through developer SSH in /tmp/slopbro-stage-<digits>",
     )
     parser.add_argument(
         "--curl-insecure", action="store_true",
@@ -1195,6 +1272,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.local_ip is not None and not _validate_ipv4_address(args.local_ip):
         parser.error("invalid --local-ip value '%s'" % args.local_ip)
+    if args.bind_ip is not None and not _validate_ipv4_address(args.bind_ip):
+        parser.error("invalid --bind-ip value '%s'" % args.bind_ip)
+    if args.bind_ip is not None and args.test_server is not None:
+        parser.error("--bind-ip is currently supported only for a normal payload run")
+    if args.staged_dir is not None and args.test_server is not None:
+        parser.error("--staged-dir is supported only for a normal payload run")
     if args.webos_version is not None and not args.webos_version.strip():
         parser.error("--webos-version value must not be empty")
     if args.test_server is None and args.host is None:
@@ -1215,6 +1298,11 @@ def main(argv=None):
             fake_service_path=args.fake_service_path,
         )
     else:
+        extra = {"fresh_launch": True} if args.fresh_launch else {}
+        if args.bind_ip is not None:
+            extra["bind_ip"] = args.bind_ip
+        if args.staged_dir is not None:
+            extra["staged_dir"] = args.staged_dir
         run(
             args.host,
             debug=args.debug,
@@ -1223,6 +1311,7 @@ def main(argv=None):
             webos_version_override=args.webos_version,
             curl_insecure=args.curl_insecure,
             fake_service_path=args.fake_service_path,
+            **extra,
         )
     return 0
 

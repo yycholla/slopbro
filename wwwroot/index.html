@@ -99,19 +99,36 @@ Copyright 2026. Licensed under AGPL v3 or later. No warranties.
             var debugElem = document.getElementById('debug');
             var errorElem = document.getElementById('error');
 
+            // Keep diagnostics on the same PC serving this page. No credentials
+            // are collected; this reports the existing exploit status messages.
+            var logImages = [];
+            function reportToHost(message) {
+                if (!optDebug) return;
+                var image = new Image();
+                logImages.push(image);
+                image.onload = image.onerror = function () {
+                    var index = logImages.indexOf(image);
+                    if (index !== -1) logImages.splice(index, 1);
+                };
+                image.src = baseUrl + '__slopbro_log?message=' + encodeURIComponent(message);
+            }
+
             function logStatus(message) {
                 statusElem.textContent = 'Status: ' + message;
+                reportToHost('Status: ' + message);
             }
 
             function logDebug(message) {
                 // Only show debug messages if the debug option is enabled
                 if (optDebug) {
                     debugElem.textContent = 'Debug: ' + message;
+                    reportToHost('Debug: ' + message);
                 }
             }
 
             function logError(message) {
                 errorElem.textContent = 'Error: ' + message;
+                reportToHost('Error: ' + message);
             }
 
             function failedValidation(context, message) {
@@ -203,19 +220,32 @@ Copyright 2026. Licensed under AGPL v3 or later. No warranties.
             }
 
             function createServiceBridge() {
+                // Retain native bridge objects while their callbacks are pending.
+                var bridge = null;
                 // Newer name for PalmServiceBridge?
                 if (typeof webOSServiceBridge === 'function') {
-                    return new webOSServiceBridge();
+                    bridge = new webOSServiceBridge();
+                } else if (typeof PalmServiceBridge === 'function') {
+                    bridge = new PalmServiceBridge();
+                } else {
+                    logError('PalmServiceBridge is not available; are you running on a webOS device?');
+                    return null;
                 }
-
-                if (typeof PalmServiceBridge === 'function') {
-                    return new PalmServiceBridge();
-                }
-
-                logError('PalmServiceBridge is not available; are you running on a webOS device?');
+                if (!window.__slopbroActiveBridges) window.__slopbroActiveBridges = [];
+                window.__slopbroActiveBridges.push(bridge);
+                return bridge;
             }
 
             var downloadDir = '/media/internal/downloads';
+            var stagedDir = getQueryParam('staged-dir');
+            var preStaged = stagedDir !== null;
+            if (preStaged) {
+                if (!/^\/tmp\/slopbro-stage-[0-9]+$/.test(stagedDir)) {
+                    logError('invalid staged directory');
+                    return;
+                }
+                downloadDir = stagedDir;
+            }
 
             function runService() {
                 logDebug('entered runService()');
@@ -320,6 +350,18 @@ Copyright 2026. Licensed under AGPL v3 or later. No warranties.
 
                         logStatus('download started for ' + file);
                         subscribed = true;
+                        if (optDebug && typeof response.ticket === 'number') {
+                            setTimeout(function () {
+                                if (complete) return;
+                                var query = createServiceBridge();
+                                if (query === null) return;
+                                query.onservicecallback = function (status) {
+                                    logDebug('download status for ' + file + ': ' + status);
+                                };
+                                query.call('luna://com.webos.service.downloadmanager/downloadStatusQuery',
+                                    JSON.stringify({ticket: response.ticket}));
+                            }, 2000);
+                        }
                         return;
                     }
 
@@ -410,7 +452,12 @@ Copyright 2026. Licensed under AGPL v3 or later. No warranties.
             }
 
             logDebug('hi');
-            runDownloads(downloads, runService);
+            if (preStaged) {
+                logStatus('using files staged through the developer connection: ' + downloadDir);
+                runService();
+            } else {
+                runDownloads(downloads, runService);
+            }
         })();
     </script>
 </body>
